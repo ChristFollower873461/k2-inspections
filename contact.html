@@ -63,7 +63,7 @@
           <article class="contact-card">
             <span class="badge">Request Form</span>
             <h2 class="section-title">Inspection Request</h2>
-            <form action="mailto:ksquaredinspectionsfl@gmail.com" method="post" enctype="text/plain">
+            <form id="lead-form" novalidate>
               <div class="form-row">
                 <div>
                   <label for="name">Full Name</label>
@@ -80,8 +80,8 @@
                   <input id="phone" name="phone" type="tel" required autocomplete="tel" />
                 </div>
                 <div>
-                  <label for="service-dropdown">Service Needed</label>
-                  <select id="service-dropdown" name="service-dropdown" required>
+                  <label for="service">Service Needed</label>
+                  <select id="service" name="service" required>
                     <option value="">Select a service</option>
                     <option>Pre-Listing Inspection</option>
                     <option>Home Inspection</option>
@@ -99,10 +99,10 @@
                 </div>
               </div>
               <div>
-                <label for="address">Property Address</label>
+                <label for="propertyAddress">Property Address</label>
                 <input
-                  id="address"
-                  name="property-address"
+                  id="propertyAddress"
+                  name="propertyAddress"
                   type="text"
                   required
                   autocomplete="street-address"
@@ -113,9 +113,11 @@
                 <textarea id="message" name="message" required></textarea>
               </div>
               <button class="btn btn-primary" type="submit">Send Request</button>
+              <p id="form-status" class="form-status" role="status" aria-live="polite"></p>
               <p class="form-note">
-                This form uses your device email app via `mailto`. If it does not open, call or email
-                us directly.
+                If the form cannot be submitted, use
+                <a id="mailto-fallback" href="mailto:ksquaredinspectionsfl@gmail.com">this email fallback</a>
+                or call us directly.
               </p>
             </form>
           </article>
@@ -189,10 +191,80 @@
               <a href="about.html">About</a>
               <a href="contact.html">Contact</a>
             </div>
+            <p class="footer-admin">
+              <a class="admin-login-link" href="https://hq.k2inspections.com/login">Admin Login</a>
+            </p>
           </div>
         </div>
         <div class="footer-bottom">© 2026 K Squared Inspections. All rights reserved.</div>
       </div>
     </footer>
+
+    <script>
+      (function () {
+        const form = document.getElementById("lead-form");
+        const submitButton = form ? form.querySelector("button[type='submit']") : null;
+        const formStatus = document.getElementById("form-status");
+        const endpoint = "https://hq.k2inspections.com/api/leads";
+
+        if (!form || !submitButton || !formStatus) {
+          return;
+        }
+
+        const setStatus = function (message, state) {
+          formStatus.textContent = message;
+          formStatus.className = "form-status " + state;
+        };
+
+        form.addEventListener("submit", async function (event) {
+          event.preventDefault();
+
+          if (!form.checkValidity()) {
+            form.reportValidity();
+            return;
+          }
+
+          const formData = new FormData(form);
+          const payload = {
+            name: String(formData.get("name") || "").trim(),
+            email: String(formData.get("email") || "").trim(),
+            phone: String(formData.get("phone") || "").trim(),
+            service: String(formData.get("service") || "").trim(),
+            propertyAddress: String(formData.get("propertyAddress") || "").trim(),
+            message: String(formData.get("message") || "").trim(),
+          };
+
+          submitButton.disabled = true;
+          submitButton.setAttribute("aria-busy", "true");
+          setStatus("Sending your request...", "pending");
+
+          try {
+            const response = await fetch(endpoint, {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                Accept: "application/json",
+              },
+              body: JSON.stringify(payload),
+            });
+
+            if (!response.ok) {
+              throw new Error("Lead submission failed");
+            }
+
+            form.reset();
+            setStatus("Thanks, your request was sent successfully. We will contact you shortly.", "success");
+          } catch (error) {
+            setStatus(
+              "We could not send your request right now. Please try again, call us, or use the email fallback link.",
+              "error"
+            );
+          } finally {
+            submitButton.disabled = false;
+            submitButton.removeAttribute("aria-busy");
+          }
+        });
+      })();
+    </script>
   </body>
 </html>

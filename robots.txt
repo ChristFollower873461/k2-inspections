@@ -1,4 +1,4 @@
 User-agent: *
 Allow: /
 
-Sitemap: https://www.ksquaredinspections.com/sitemap.xml
+Sitemap: https://k2inspections.com/sitemap.xml
