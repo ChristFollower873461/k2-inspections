@@ -1,0 +1,14 @@
+{
+  "name": "k2-inspections-tests",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": "^22.22.2 || ^24.15.0 || >=26.0.0"
+  },
+  "scripts": {
+    "test": "cd .. && bash scripts/validate-site.sh && node --test tests/*.test.mjs"
+  },
+  "devDependencies": {
+    "jsdom": "30.0.1"
+  }
+}

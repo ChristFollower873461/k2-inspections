@@ -39,9 +39,22 @@ Then open `http://localhost:8080`.
 
 ## Verification
 
+For the static structure check only:
+
 ```bash
 bash scripts/validate-site.sh
 ```
+
+For the complete CI check, use Node.js 22.23.1 and npm:
+
+```bash
+npm --prefix tests ci --ignore-scripts
+npm --prefix tests test
+```
+
+This runs the structure check and contact-form tests against the actual page script.
+The tests use synthetic data and local responses; they do not submit leads to the CRM.
+JSDOM is a development dependency isolated under `tests/`; serving the site still requires no Node.js runtime.
 
 ## Deployment Notes
 - Primary domain: `k2inspections.com`
