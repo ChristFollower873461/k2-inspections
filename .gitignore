@@ -9,3 +9,6 @@
 
 # Logs
 *.log
+
+# Local verification dependencies
+node_modules/

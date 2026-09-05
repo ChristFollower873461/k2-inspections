@@ -252,8 +252,17 @@
               throw new Error("Lead submission failed");
             }
 
-            form.reset();
-            setStatus("Thanks, your request was sent successfully. We will contact you shortly.", "success");
+            const currentFormData = new FormData(form);
+            const draftChanged = Array.from(formData.entries()).some(function ([name, value]) {
+              return currentFormData.get(name) !== value;
+            });
+
+            if (draftChanged) {
+              setStatus("Your request was sent. Your newer edits are still here and have not been sent.", "success");
+            } else {
+              form.reset();
+              setStatus("Thanks, your request was sent successfully. We will contact you shortly.", "success");
+            }
           } catch (error) {
             setStatus(
               "We could not send your request right now. Please try again, call us, or use the email fallback link.",
