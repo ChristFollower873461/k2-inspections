@@ -206,6 +206,7 @@
         const submitButton = form ? form.querySelector("button[type='submit']") : null;
         const formStatus = document.getElementById("form-status");
         const endpoint = "https://hq.k2inspections.com/api/leads";
+        let sending = false;
 
         if (!form || !submitButton || !formStatus) {
           return;
@@ -218,6 +219,7 @@
 
         form.addEventListener("submit", async function (event) {
           event.preventDefault();
+          if (sending) return;
 
           if (!form.checkValidity()) {
             form.reportValidity();
@@ -234,23 +236,49 @@
             message: String(formData.get("message") || "").trim(),
           };
 
+          sending = true;
           submitButton.disabled = true;
           submitButton.setAttribute("aria-busy", "true");
           setStatus("Sending your request...", "pending");
 
+          let timeout;
           try {
+            // Store only an opaque identity and content hash, never contact fields.
+            // Save before sending so the same draft can recover after a reload.
+            const bytes = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(JSON.stringify(payload)));
+            const fingerprint = Array.from(new Uint8Array(bytes), function (byte) {
+              return byte.toString(16).padStart(2, "0");
+            }).join("");
+            const storageKey = "k2-lead-retry-v1:" + fingerprint;
+            let submissionId = sessionStorage.getItem(storageKey);
+            if (submissionId === null) {
+              submissionId = crypto.randomUUID();
+              sessionStorage.setItem(storageKey, submissionId);
+            }
+            if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(submissionId) ||
+                sessionStorage.getItem(storageKey) !== submissionId) {
+              throw new Error("Retry identity could not be preserved");
+            }
+            const controller = new AbortController();
+            timeout = setTimeout(function () { controller.abort(); }, 20000);
             const response = await fetch(endpoint, {
               method: "POST",
               headers: {
                 "Content-Type": "application/json",
                 Accept: "application/json",
               },
-              body: JSON.stringify(payload),
+              body: JSON.stringify(Object.assign({}, payload, { submissionId: submissionId })),
+              signal: controller.signal,
             });
 
             if (!response.ok) {
               throw new Error("Lead submission failed");
             }
+            const receipt = await response.json();
+            if (receipt.success !== true || typeof receipt.id !== "string" || !receipt.id || receipt.submissionId !== submissionId) {
+              throw new Error("Lead acceptance could not be confirmed");
+            }
+            sessionStorage.removeItem(storageKey);
 
             const currentFormData = new FormData(form);
             const draftChanged = Array.from(formData.entries()).some(function ([name, value]) {
@@ -265,10 +293,12 @@
             }
           } catch (error) {
             setStatus(
-              "We could not send your request right now. Please try again, call us, or use the email fallback link.",
+              "We could not confirm your request. Retry the same details to check safely, or call us or use the email fallback link if the problem continues.",
               "error"
             );
           } finally {
+            clearTimeout(timeout);
+            sending = false;
             submitButton.disabled = false;
             submitButton.removeAttribute("aria-busy");
           }

@@ -1,196 +1,191 @@
 import assert from 'node:assert/strict';
-import test from 'node:test';
+import nodeTest from 'node:test';
+const test = (name, fn) => nodeTest(name, { timeout: 5000 }, fn);
 import { readFileSync } from 'node:fs';
+import { webcrypto } from 'node:crypto';
 import { JSDOM } from 'jsdom';
 
 const html = readFileSync(new URL('../contact.html', import.meta.url), 'utf8');
+const draft = {
+  name: '  Synthetic Reviewer  ', email: 'reviewer@example.invalid', phone: '  202-555-0100  ',
+  service: 'Home Inspection', propertyAddress: '  Synthetic property, not a real address  ',
+  message: '  Local test only; do not submit to a provider.  ',
+};
+const accepted = (call, status = 201) => Response.json({ success: true, id: 'synthetic-lead-id', submissionId: call.payload.submissionId }, { status });
 
-test('invalid required fields and invalid email do not send a lead', async t => {
-  const page = mount(t, () => { throw new Error('unexpected submission'); });
+function deferred() {
+  let resolve, reject;
+  const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
+  return { promise, resolve, reject };
+}
+function mount(t, respond = (attempt, call) => accepted(call), options = {}) {
+  const dom = new JSDOM(html, { url: 'https://k2-local.invalid/contact.html', runScripts: 'outside-only' });
+  t.after(() => dom.window.close());
+  const { window } = dom;
+  Object.defineProperty(window.crypto, 'subtle', { value: webcrypto.subtle });
+  window.TextEncoder = TextEncoder;
+  for (const [key, value] of Object.entries(options.storage || {})) window.sessionStorage.setItem(key, value);
+  options.configure?.(window);
+  const form = window.document.getElementById('lead-form'), button = form.querySelector('button[type="submit"]');
+  const status = window.document.getElementById('form-status'), calls = [], signals = [];
+  const signal = n => signals[n - 1] ||= deferred();
+  window.fetch = (url, request) => {
+    assert.equal(url, 'https://hq.k2inspections.com/api/leads');
+    const call = { url, options: request, payload: JSON.parse(request.body) };
+    calls.push(call);
+    signal(calls.length).resolve(call);
+    // Only synthetic responses. No external resource, browser or network execution.
+    return respond(calls.length, call);
+  };
+  let completion;
+  const add = form.addEventListener.bind(form);
+  form.addEventListener = (name, handler, opts) => name !== 'submit' ? add(name, handler, opts) :
+    add(name, function (event) { completion = Promise.resolve(handler.call(this, event)); }, opts);
+  const scripts = [...window.document.scripts].filter(s => !s.src && s.textContent.includes('lead-form'));
+  assert.equal(scripts.length, 1);
+  window.eval(scripts[0].textContent);
+  return {
+    window, form, button, status, calls,
+    fill(values = draft) { for (const [name, value] of Object.entries(values)) form.elements.namedItem(name).value = value; },
+    values() { return Object.fromEntries(Object.keys(draft).map(name => [name, form.elements.namedItem(name).value])); },
+    storage() { return Object.fromEntries(Object.keys(window.sessionStorage).map(k => [k, window.sessionStorage.getItem(k)])); },
+    sent(n = 1) { return signal(n).promise; },
+    submit() {
+      completion = undefined;
+      form.requestSubmit();
+      assert.ok(completion, 'native form submission must invoke the actual handler');
+      return completion;
+    },
+  };
+}
+
+test('required fields and invalid email reject before sending', async t => {
+  const page = mount(t);
   await page.submit();
   page.fill({ ...draft, email: 'invalid-email' });
   await page.submit();
   assert.equal(page.calls.length, 0);
-  assert.equal(page.values().message, draft.message);
   assert.equal(page.button.disabled, false);
 });
 
-test('successful request submits trimmed fields and resets only after the response', async t => {
-  const request = deferred();
-  const page = mount(t, () => request.promise);
+test('persists identity before sending; confirms a durable receipt before resetting', async t => {
+  const reply = deferred(), page = mount(t, () => reply.promise);
   page.fill();
-  const complete = page.submit();
+  const done = page.submit(), call = await page.sent();
   assert.equal(page.button.disabled, true);
   assert.equal(page.button.getAttribute('aria-busy'), 'true');
   assert.ok(page.status.classList.contains('pending'));
   assert.equal(page.values().message, draft.message);
-  assert.equal(page.calls.length, 1);
-  assert.equal(page.calls[0].options.method, 'POST');
-  assert.equal(page.calls[0].options.headers['Content-Type'], 'application/json');
-  assert.deepEqual(page.calls[0].payload, Object.fromEntries(Object.entries(draft).map(([key, value]) => [key, value.trim()])));
-  request.resolve(new Response('', { status: 201 }));
-  await complete;
+  const { submissionId, ...payload } = call.payload;
+  assert.deepEqual(payload, Object.fromEntries(Object.entries(draft).map(([k, v]) => [k, v.trim()])));
+  assert.match(submissionId, /^[0-9a-f-]{36}$/);
+  assert.deepEqual(Object.values(page.storage()), [submissionId]);
+  assert.match(Object.keys(page.storage())[0], /^k2-lead-retry-v1:[0-9a-f]{64}$/);
+  assert.equal(call.options.method, 'POST');
+  reply.resolve(accepted(call));
+  await done;
   assert.ok(page.status.classList.contains('success'));
-  assert.ok(Object.values(page.values()).every(value => value === ''));
+  assert.ok(Object.values(page.values()).every(v => v === ''));
+  assert.deepEqual(page.storage(), {});
   assert.equal(page.button.disabled, false);
   assert.equal(page.button.hasAttribute('aria-busy'), false);
 });
 
-for (const failure of ['HTTP 500', 'network rejection']) {
-  test(`${failure} keeps the full draft and allows a successful retry`, async t => {
-    const page = mount(t, attempt => attempt > 1
-      ? Promise.resolve(new Response('', { status: 200 }))
-      : failure === 'HTTP 500'
-        ? Promise.resolve(new Response('', { status: 500 }))
-        : Promise.reject(new TypeError('synthetic network failure')));
+for (const failure of ['HTTP 503', 'network rejection', 'invalid JSON receipt', 'wrong identity receipt']) {
+  test(`${failure} preserves the draft and reuses identical request on retry`, async t => {
+    const page = mount(t, (attempt, call) => attempt > 1 ? accepted(call, 200) :
+      failure === 'HTTP 503' ? new Response('', { status: 503 }) :
+      failure === 'network rejection' ? Promise.reject(new TypeError('synthetic response loss')) :
+      failure === 'invalid JSON receipt' ? new Response('<html>proxy</html>') :
+      Response.json({ success: true, id: 'synthetic', submissionId: 'wrong' }));
     page.fill();
     await page.submit();
     assert.deepEqual(page.values(), draft);
     assert.ok(page.status.classList.contains('error'));
     assert.equal(page.button.disabled, false);
-    assert.equal(page.button.hasAttribute('aria-busy'), false);
-    assert.match(page.window.document.getElementById('mailto-fallback').getAttribute('href'), /^mailto:/);
     await page.submit();
-    assert.equal(page.calls.length, 2);
+    assert.deepEqual(page.calls[1].payload, page.calls[0].payload);
     assert.ok(page.status.classList.contains('success'));
-    assert.ok(Object.values(page.values()).every(value => value === ''));
+    assert.match(page.window.document.getElementById('mailto-fallback').getAttribute('href'), /^mailto:/);
   });
 }
 
-test('success preserves a newer unsent message and a later retry sends those edits', async t => {
-  const request = deferred();
-  const page = mount(t, attempt => attempt === 1
-    ? request.promise
-    : Promise.resolve(new Response('', { status: 200 })));
-  page.fill();
-  const complete = page.submit();
-  const changedMessage = 'New unsent inspection detail entered while sending.';
-  page.form.elements.namedItem('message').value = changedMessage;
-  page.form.elements.namedItem('message').dispatchEvent(new page.window.Event('input', { bubbles: true }));
-  assert.equal(page.calls[0].payload.message, draft.message.trim());
-  request.resolve(new Response('', { status: 200 }));
-  await complete;
-  assert.deepEqual(page.values(), { ...draft, message: changedMessage });
-  assert.ok(page.status.classList.contains('success'));
-  assert.match(page.status.textContent, /newer edits.*have not been sent/i);
-  assert.equal(page.button.disabled, false);
-  assert.equal(page.button.hasAttribute('aria-busy'), false);
+test('reload retains identity without storing contact fields', async t => {
+  const first = mount(t, () => Promise.reject(new TypeError('synthetic lost response')));
+  first.fill(); await first.submit();
+  const stored = first.storage(), text = JSON.stringify(stored);
+  for (const value of Object.values(draft)) assert.ok(!text.includes(value.trim()));
+  const second = mount(t, undefined, { storage: stored });
+  second.fill(); await second.submit();
+  assert.deepEqual(second.calls[0].payload, first.calls[0].payload);
+  assert.ok(second.status.classList.contains('success'));
+});
 
+test('duplicate submit while preparing identity or awaiting response sends once', async t => {
+  const reply = deferred(), page = mount(t, () => reply.promise);
+  page.fill(); const done = page.submit();
   await page.submit();
-  assert.equal(page.calls.length, 2);
-  assert.equal(page.calls[1].payload.message, changedMessage);
-  assert.ok(Object.values(page.values()).every(value => value === ''));
-  assert.doesNotMatch(page.status.textContent, /have not been sent/i);
+  const call = await page.sent(); await page.submit();
+  assert.equal(page.calls.length, 1);
+  reply.resolve(accepted(call)); await done;
 });
 
-test('success also preserves changes to the selected inspection service', async t => {
-  const request = deferred();
-  const page = mount(t, () => request.promise);
-  page.fill();
-  const complete = page.submit();
-  page.form.elements.namedItem('service').value = 'Radon Testing';
-  page.form.elements.namedItem('service').dispatchEvent(new page.window.Event('change', { bubbles: true }));
-  request.resolve(new Response('', { status: 200 }));
-  await complete;
-  assert.equal(page.calls[0].payload.service, 'Home Inspection');
-  assert.deepEqual(page.values(), { ...draft, service: 'Radon Testing' });
-  assert.match(page.status.textContent, /newer edits.*have not been sent/i);
+for (const [field, value] of [['message', 'New unsent detail.'], ['service', 'Radon Testing'], ['message', draft.message + '  ']]) {
+  test(`success preserves newer raw ${field} edits`, async t => {
+    const reply = deferred(), page = mount(t, (attempt, call) => attempt === 1 ? reply.promise : accepted(call));
+    page.fill(); const done = page.submit(); const call = await page.sent();
+    page.form.elements.namedItem(field).value = value;
+    reply.resolve(accepted(call)); await done;
+    assert.deepEqual(page.values(), { ...draft, [field]: value });
+    assert.match(page.status.textContent, /newer edits.*have not been sent/i);
+    await page.submit();
+    assert.equal(page.calls[1].payload[field], value.trim());
+    assert.notEqual(page.calls[1].payload.submissionId, call.payload.submissionId);
+    assert.ok(Object.values(page.values()).every(v => v === ''));
+  });
+}
+
+test('uncertain older request retains identity when a different draft is attempted', async t => {
+  const page = mount(t, () => Promise.reject(new TypeError('synthetic lost response')));
+  page.fill(); await page.submit();
+  page.fill({ ...draft, message: 'Different request.' }); await page.submit();
+  assert.notEqual(page.calls[1].payload.submissionId, page.calls[0].payload.submissionId);
+  page.fill(); await page.submit();
+  assert.deepEqual(page.calls[2].payload, page.calls[0].payload);
 });
 
-test('success preserves raw field edits even when their trimmed payload would match', async t => {
-  const request = deferred();
-  const page = mount(t, () => request.promise);
-  page.fill();
-  const complete = page.submit();
-  const changedMessage = draft.message + '  ';
-  page.form.elements.namedItem('message').value = changedMessage;
-  request.resolve(new Response('', { status: 200 }));
-  await complete;
-  assert.equal(page.values().message, changedMessage);
-  assert.match(page.status.textContent, /newer edits.*have not been sent/i);
+test('new intentional inquiry after acknowledged success gets a new identity', async t => {
+  const page = mount(t);
+  page.fill(); await page.submit(); page.fill(); await page.submit();
+  assert.notEqual(page.calls[1].payload.submissionId, page.calls[0].payload.submissionId);
 });
 
-test('a failed pending request retains edits and retries the current draft', async t => {
-  const request = deferred();
-  const page = mount(t, attempt => attempt === 1
-    ? request.promise
-    : Promise.resolve(new Response('', { status: 200 })));
-  page.fill();
-  const complete = page.submit();
-  const changedMessage = 'New detail retained after a failed request.';
-  page.form.elements.namedItem('message').value = changedMessage;
-  request.reject(new TypeError('synthetic network failure'));
-  await complete;
-  assert.deepEqual(page.values(), { ...draft, message: changedMessage });
+for (const broken of ['storage denied', 'storage corrupt', 'crypto unavailable']) {
+  test(`${broken} cannot silently send an unprotected request`, async t => {
+    const page = mount(t, undefined, { configure(window) {
+      if (broken === 'storage denied') Object.defineProperty(window, 'sessionStorage', { get() { throw new Error('synthetic storage denied'); } });
+      else if (broken === 'storage corrupt') window.Storage.prototype.getItem = () => 'corrupt';
+      else Object.defineProperty(window, 'crypto', { value: {} });
+    } });
+    page.fill(); await page.submit();
+    assert.equal(page.calls.length, 0);
+    assert.deepEqual(page.values(), draft);
+    assert.ok(page.status.classList.contains('error'));
+    assert.equal(page.button.disabled, false);
+  });
+}
+
+test('request timeout leaves the original identity available for a retry', async t => {
+  let timeout;
+  const page = mount(t, (attempt, call) => attempt > 1 ? accepted(call) : new Promise((resolve, reject) =>
+    call.options.signal.addEventListener('abort', () => reject(new Error('synthetic abort')), { once: true })), {
+    configure(window) {
+      const original = window.setTimeout.bind(window);
+      window.setTimeout = (fn, ms, ...args) => ms === 20000 ? (timeout = fn, 0) : original(fn, ms, ...args);
+    },
+  });
+  page.fill(); const done = page.submit(); await page.sent(); timeout(); await done;
   assert.ok(page.status.classList.contains('error'));
-  assert.equal(page.button.disabled, false);
   await page.submit();
-  assert.equal(page.calls[1].payload.message, changedMessage);
-  assert.ok(page.status.classList.contains('success'));
-  assert.ok(Object.values(page.values()).every(value => value === ''));
+  assert.deepEqual(page.calls[1].payload, page.calls[0].payload);
 });
-
-const draft = {
-  name: '  Synthetic Reviewer  ',
-  email: 'reviewer@example.invalid',
-  phone: '  202-555-0100  ',
-  service: 'Home Inspection',
-  propertyAddress: '  Synthetic property, not a real address  ',
-  message: '  Local test only; do not submit to a provider.  ',
-};
-
-function deferred() {
-  let resolve;
-  let reject;
-  const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
-  return { promise, resolve, reject };
-}
-
-function mount(t, respond) {
-  // outside-only executes neither script tags nor external resources automatically.
-  const dom = new JSDOM(html, {
-    url: 'https://k2-local.invalid/contact.html',
-    runScripts: 'outside-only',
-  });
-  t.after(() => dom.window.close());
-  const { window } = dom;
-  const form = window.document.getElementById('lead-form');
-  const button = form.querySelector('button[type="submit"]');
-  const status = window.document.getElementById('form-status');
-  const calls = [];
-  window.fetch = (url, options) => {
-    // Captured locally. There is no call to Node fetch or any network transport.
-    assert.equal(url, 'https://hq.k2inspections.com/api/leads');
-    calls.push({ url, options, payload: JSON.parse(options.body) });
-    return respond(calls.length);
-  };
-
-  let completion;
-  const add = form.addEventListener.bind(form);
-  form.addEventListener = (name, handler, options) => {
-    if (name !== 'submit') return add(name, handler, options);
-    return add(name, function (event) {
-      // Observe the promise returned by the actual registered handler; do not copy it.
-      completion = Promise.resolve(handler.call(this, event));
-    }, options);
-  };
-  const scripts = [...window.document.scripts].filter(script => !script.src && script.textContent.includes('lead-form'));
-  assert.equal(scripts.length, 1, 'one actual contact handler must be present');
-  window.eval(scripts[0].textContent);
-
-  return {
-    window, form, button, status, calls,
-    fill(values = draft) {
-      for (const [name, value] of Object.entries(values)) form.elements.namedItem(name).value = value;
-    },
-    values() {
-      return Object.fromEntries(Object.keys(draft).map(name => [name, form.elements.namedItem(name).value]));
-    },
-    submit() {
-      completion = undefined;
-      form.requestSubmit();
-      assert.ok(completion, 'native requestSubmit must invoke the actual form handler');
-      return completion;
-    },
-  };
-}
